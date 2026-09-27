@@ -1,50 +1,54 @@
 """MCP server that returns the newest PNG ffmpeg has already saved."""
 
-from __future__ import annotations
-
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from kvmcp.capture import Capture
+from kvmcp.capture import VIDEO_SIZES, Capturer
 
-capture: Capture | None = None
+capturer: Capturer | None = None
 
 
 @asynccontextmanager
 async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
-    assert capture is not None
-    capture.start()
+    assert capturer is not None
+    capturer.start()
     try:
         yield None
     finally:
-        capture.stop()
+        capturer.stop()
 
 
-mcp = MCPServer(
-    'kvmcp',
-    instructions='调用 capture_frame 获取采集卡最近一张 PNG。编码在后台完成，这次调用只读取已写好的文件。',
-    lifespan=lifespan,
-)
+mcp = MCPServer(name='kvmcp', version='0.1.0', lifespan=lifespan)
 
 
-@mcp.tool(
-    structured_output=False,
-    description='返回采集卡最近一张已经写好的 PNG，以及从本次采集开始到这帧写好的秒数，精确到毫秒。不重新打开设备，也不在这次调用里编码。',
-)
-def capture_frame() -> tuple[str, Image]:
-    assert capture is not None
-    frame = capture.latest()
-    if frame is None:
-        raise ToolError('还没有画面。采集刚启动，或采集卡未接上。')
-    path, elapsed = frame
-    return (f'{elapsed:.3f}', Image(path=path))
+@mcp.tool(structured_output=False, description='查看最新屏幕画面')
+def latest_frame() -> tuple[str, Image]:
+    assert capturer is not None
+    frame = capturer.latest()
+    if isinstance(frame, str):
+        raise ToolError(frame)
+    return (f'`画面延迟 {frame.age:.3f} 秒` `{frame.video_size}` `{frame.input_format}`', Image(data=frame.data, format='png'))
 
 
-def serve(cache_dir: Path, host: str, port: int, device: str, mode: str) -> None:
-    global capture
-    capture = Capture(device, cache_dir, mode)
-    mcp.run(transport='streamable-http', host=host, port=port, json_response=True)
+@mcp.tool(structured_output=False, description='切换采集分辨率，可选 1920x1080 或 2560x1440')
+def set_video_size(video_size: Literal[*VIDEO_SIZES]) -> None:
+    if video_size not in VIDEO_SIZES:
+        raise ToolError(f'不支持的分辨率: {video_size}, 支持: {", ".join(VIDEO_SIZES)}')
+
+    assert capturer is not None
+    try:
+        capturer.set_video_size(video_size)
+    except (OSError, ValueError, KeyError) as exc:
+        raise ToolError(f'切换采集分辨率失败: {exc}') from exc
+
+
+def serve(cfg: dict, config_path: Path) -> None:
+    global capturer
+    capturer = Capturer(cfg, config_path)
+
+    mcp.run(transport='streamable-http', host=cfg['server']['host'], port=cfg['server']['port'], json_response=True)

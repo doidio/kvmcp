@@ -1,188 +1,343 @@
-"""Keep one ffmpeg process writing the latest frame as a PNG."""
+"""Discover a compatible video input and keep its newest PNG available."""
 
 from __future__ import annotations
 
 import logging
+import os
+import re
 import subprocess
+import tempfile
 import threading
 import time
+import uuid
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+import tomlkit
+
 log = logging.getLogger(__name__)
 
-CAPTURE_DIR = 'capture'
-FRAME_NAME = 'latest.png'
-
-MODES = {
-    '1080p': {'input_format': 'yuyv422', 'video_size': '1920x1080', 'framerate': '5', 'output_fps': '1'},
-    '1440p': {'input_format': 'yuyv422', 'video_size': '2560x1440', 'framerate': '5', 'output_fps': '1'},
-}
-
-
-def video_nodes_for_card(list_output: str, name: str) -> list[str]:
-    """Return /dev/video nodes listed under a matching v4l2 card."""
-    nodes: list[str] = []
-    current = False
-    for line in list_output.splitlines():
-        if line.startswith((' ', '\t')):
-            path = line.strip()
-            if current and path.startswith('/dev/video'):
-                nodes.append(path)
-            continue
-        current = name in line
-    return nodes
+VIDEO_SIZES = ('1920x1080', '2560x1440')
+FRAME_TIMEOUT = 8.0
+POLL_INTERVAL = 0.25
+PIXEL_FORMATS = {'yuyv422': 'YUYV', 'mjpeg': 'MJPG'}
+FORMAT_RE = re.compile(r"\[\d+\]:\s*'([^']+)'")
+SIZE_RE = re.compile(r'Size:\s*Discrete\s+(\d+x\d+)')
+FPS_RE = re.compile(r'\((\d+(?:\.\d+)?) fps\)')
 
 
-def is_video_capture(info: str) -> bool:
-    """True when Device Caps includes Video Capture and not Metadata Capture."""
-    collecting = False
-    caps: list[str] = []
-    for line in info.splitlines():
-        if 'Device Caps' in line:
-            collecting = True
-            caps = []
-            continue
-        if not collecting:
-            continue
+@dataclass(frozen=True)
+class Frame:
+    data: bytes
+    age: float
+    video_size: str
+    input_format: str
+
+
+def _run_v4l2(*args: str) -> str:
+    result = subprocess.run(['v4l2-ctl', *args], capture_output=True, text=True, timeout=5, check=False)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f'v4l2-ctl 退出 {result.returncode}')
+    return result.stdout
+
+
+def _video_nodes(output: str) -> list[str]:
+    return [line.strip() for line in output.splitlines() if line.strip().startswith('/dev/video')]
+
+
+def _is_video_capture(info: str) -> bool:
+    """Use per-node device capabilities, not card-wide capabilities."""
+    section = info.split('Device Caps', 1)
+    if len(section) != 2:
+        return False
+    capabilities = []
+    for line in section[1].splitlines()[1:]:
         if not line.startswith((' ', '\t')):
             break
-        caps.append(line.strip())
-    return 'Video Capture' in caps and 'Metadata Capture' not in caps
+        capabilities.append(line.strip())
+    return 'Video Capture' in capabilities
 
 
-def find_capture_device(device: str) -> str | None:
-    """Pick the capture node whose v4l2 name matches. Nodes move after replug."""
-    listed = subprocess.run(
-        ['v4l2-ctl', '--list-devices'],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if listed.returncode != 0:
-        log.warning('v4l2-ctl --list-devices failed: %s', listed.stderr.strip())
-        return None
-    for node in video_nodes_for_card(listed.stdout, device):
-        info = subprocess.run(
-            ['v4l2-ctl', '-d', node, '--info'],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if info.returncode == 0 and is_video_capture(info.stdout):
-            return node
-    return None
+def _supports_mode(formats: str, pixel_format: str, video_size: str, framerate: float) -> bool:
+    """Match format and size; ffmpeg negotiates the exact frame interval."""
+    fourcc = PIXEL_FORMATS.get(pixel_format, pixel_format.upper())
+    current_format = None
+    matching_size = False
+    frame_rates: list[float] = []
+
+    def supported() -> bool:
+        return matching_size and (not frame_rates or max(frame_rates) >= framerate)
+
+    for line in formats.splitlines():
+        if match := FORMAT_RE.search(line):
+            if current_format == fourcc and supported():
+                return True
+            current_format = match.group(1)
+            matching_size = False
+            frame_rates = []
+        elif match := SIZE_RE.search(line):
+            if current_format == fourcc and supported():
+                return True
+            matching_size = current_format == fourcc and match.group(1) == video_size
+            frame_rates = []
+        elif matching_size and (match := FPS_RE.search(line)):
+            frame_rates.append(float(match.group(1)))
+    return current_format == fourcc and supported()
 
 
-class Capture:
-    """ffmpeg subprocess whose lifetime follows this object."""
+def find_capture_devices(input_format: str, video_size: str, framerate: float) -> list[str]:
+    """Find matching image capture nodes without depending on a device brand."""
+    candidates = []
+    for node in _video_nodes(_run_v4l2('--list-devices')):
+        try:
+            if _is_video_capture(_run_v4l2('-d', node, '--info')) and _supports_mode(
+                _run_v4l2('-d', node, '--list-formats-ext'), input_format, video_size, framerate
+            ):
+                candidates.append(node)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            log.warning('Unable to inspect %s: %s', node, exc)
+    return candidates
 
-    def __init__(self, device: str, cache_dir: Path, mode: str) -> None:
-        self.device = device
-        self.cache_dir = cache_dir
-        self.capture_dir = cache_dir / CAPTURE_DIR
-        self.mode = MODES[mode]
+
+def _save_video_size(config_path: Path, video_size: str) -> None:
+    """Preserve TOML comments and replace the configuration atomically."""
+    document = tomlkit.parse(config_path.read_text(encoding='utf-8'))
+    document['capture']['video_size'] = video_size
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=config_path.parent, prefix=f'.{config_path.name}.', delete=False) as file:
+            temporary = Path(file.name)
+            file.write(tomlkit.dumps(document))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, config_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+class Capturer:
+    """Own a background supervisor; only it starts and stops ffmpeg."""
+
+    def __init__(self, cfg: dict, config_path: Path) -> None:
+        capture = cfg['capture']
+        video_size = capture['video_size']
+        if video_size not in VIDEO_SIZES:
+            raise ValueError(f'不支持的分辨率: {video_size}')
+        self.input_format = str(capture['input_format'])
+        if not self.input_format:
+            raise ValueError('input_format 不能为空')
+        self.framerate = float(capture['framerate'])
+        if not 0 < self.framerate < 1000:
+            raise ValueError('framerate 必须大于 0 且小于 1000')
+
+        self.config_path = config_path.resolve()
+        self.capture_dir = Path(cfg['cache_dir']) / 'capture'
+        self._desired_size = video_size
+        self._revision = 0
+        self._active_file: Path | None = None
+        self._active_size: str | None = None
+        self._status = '采集未启动'
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._proc: subprocess.Popen[bytes] | None = None
-        self._lock = threading.Lock()
-        self._started_at: float | None = None
 
     def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
         self.capture_dir.mkdir(parents=True, exist_ok=True)
+        self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._supervise, name='kvmcp-ffmpeg', daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        self._terminate()
+        self._wake.set()
         if self._thread is not None:
-            self._thread.join(timeout=5)
-
-    def latest(self) -> tuple[Path, float] | None:
-        """Return the current frame and seconds since this capture session started."""
-        path = self.capture_dir / FRAME_NAME
-        if not _nonempty(path):
-            return None
+            self._thread.join(timeout=8)
+            if self._thread.is_alive():
+                log.error('Capture supervisor did not stop within 8 seconds')
         with self._lock:
-            started_at = self._started_at
-        if started_at is None:
-            return None
-        elapsed = path.stat().st_mtime - started_at
-        if elapsed < 0:
-            return None
-        return path, elapsed
+            self._active_file = None
+            self._active_size = None
+            self._status = '采集已停止'
+
+    def set_video_size(self, video_size: str) -> None:
+        if video_size not in VIDEO_SIZES:
+            raise ValueError(f'不支持的分辨率: {video_size}')
+        with self._lock:
+            if video_size == self._desired_size:
+                return
+            _save_video_size(self.config_path, video_size)
+            self._desired_size = video_size
+            self._revision += 1
+            self._active_file = None
+            self._active_size = None
+            self._status = '正在切换采集分辨率'
+            self._wake.set()
+
+    def latest(self) -> Frame | str:
+        with self._lock:
+            path = self._active_file
+            video_size = self._active_size
+            revision = self._revision
+            status = self._status
+        if path is None or video_size is None:
+            return status
+        try:
+            with path.open('rb') as file:
+                data = file.read()
+                modified = os.fstat(file.fileno()).st_mtime
+        except OSError:
+            return status
+        with self._lock:
+            if revision != self._revision or path != self._active_file:
+                return self._status
+        if not data:
+            return status
+        age = max(0.0, time.time() - modified)
+        if age > FRAME_TIMEOUT:
+            return '无画面：画面未更新'
+        return Frame(data, age, video_size, self.input_format)
+
+    def _snapshot(self) -> tuple[str, int]:
+        with self._lock:
+            return self._desired_size, self._revision
+
+    def _set_status(self, status: str, revision: int) -> None:
+        with self._lock:
+            if revision == self._revision:
+                self._status = status
+                self._active_file = None
+                self._active_size = None
+
+    def _wait(self, seconds: float) -> None:
+        self._wake.wait(seconds)
+        self._wake.clear()
 
     def _supervise(self) -> None:
-        with (self.capture_dir / 'ffmpeg.log').open('ab', buffering=0) as log_file:
-            while not self._stop.is_set():
-                device = find_capture_device(self.device)
-                if device is None:
-                    log.info('capture device not found')
-                    self._stop.wait(1)
-                    continue
-                log.info('starting ffmpeg on %s', device)
-                proc = self._spawn(device, log_file)
-                with self._lock:
-                    self._proc = proc
-                while not self._stop.is_set() and proc.poll() is None:
-                    self._stop.wait(1)
-                self._terminate()
-                if not self._stop.is_set():
-                    log.info('ffmpeg exited, restarting')
-                    self._stop.wait(1)
-
-    def _spawn(self, device: str, log_file: BinaryIO) -> subprocess.Popen[bytes]:
-        with self._lock:
-            self._started_at = time.time()
-        return subprocess.Popen(
-            [
-                'ffmpeg',
-                '-y',
-                '-hide_banner',
-                '-loglevel',
-                'error',
-                '-f',
-                'v4l2',
-                '-input_format',
-                self.mode['input_format'],
-                '-video_size',
-                self.mode['video_size'],
-                '-framerate',
-                self.mode['framerate'],
-                '-i',
-                device,
-                '-vf',
-                f'fps={self.mode["output_fps"]}',
-                '-f',
-                'image2',
-                '-update',
-                '1',
-                '-atomic_writing',
-                '1',
-                str(self.capture_dir / FRAME_NAME),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=log_file,
-            start_new_session=True,
-        )
-
-    def _terminate(self) -> None:
-        with self._lock:
-            proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return
-        proc.terminate()
         try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=2)
+            with ExitStack() as files:
+                try:
+                    log_file = files.enter_context((self.capture_dir / 'ffmpeg.log').open('ab', buffering=0))
+                except OSError:
+                    log.warning('Unable to open ffmpeg.log; continuing without a capture log', exc_info=True)
+                    log_file = files.enter_context(Path(os.devnull).open('ab'))
+                while not self._stop.is_set():
+                    video_size, revision = self._snapshot()
+                    try:
+                        candidates = find_capture_devices(self.input_format, video_size, self.framerate)
+                    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                        self._set_status(f'采集异常：设备扫描失败：{exc}', revision)
+                        log.exception('Capture device scan failed')
+                        self._wait(1)
+                        continue
+                    if not candidates:
+                        self._set_status('无符合当前采集模式的设备', revision)
+                        self._wait(1)
+                        continue
+                    for device in candidates:
+                        if self._stop.is_set() or revision != self._snapshot()[1]:
+                            break
+                        self._run_device(device, video_size, revision, log_file)
+                    self._wait(1)
+        except OSError as exc:
+            log.exception('Capture supervisor failed')
+            with self._lock:
+                self._active_file = None
+                self._active_size = None
+                self._status = f'采集异常：后台任务已停止：{exc}'
+
+    def _run_device(self, device: str, video_size: str, revision: int, log_file: BinaryIO) -> None:
+        path = self.capture_dir / f'frame-{uuid.uuid4().hex}.png'
+        with self._lock:
+            self._active_file = path
+            self._active_size = video_size
+            self._status = '等待新画面'
+        try:
+            process = subprocess.Popen(
+                [
+                    'ffmpeg',
+                    '-y',
+                    '-hide_banner',
+                    '-loglevel',
+                    'error',
+                    '-f',
+                    'v4l2',
+                    '-input_format',
+                    self.input_format,
+                    '-video_size',
+                    video_size,
+                    '-framerate',
+                    str(self.framerate),
+                    '-i',
+                    device,
+                    '-vf',
+                    'fps=1',
+                    '-f',
+                    'image2',
+                    '-update',
+                    '1',
+                    '-atomic_writing',
+                    '1',
+                    str(path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log_file,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self._set_status(f'采集异常：ffmpeg 启动失败：{exc}', revision)
+            log.exception('Unable to start ffmpeg on %s', device)
+            return
+
+        last_modified = 0.0
+        last_frame_at = time.monotonic()
+        failure = '无画面'
+        try:
+            while not self._stop.is_set() and revision == self._snapshot()[1]:
+                if (code := process.poll()) is not None:
+                    failure = f'采集异常：ffmpeg 退出 {code}'
+                    break
+                try:
+                    modified = path.stat().st_mtime
+                except OSError:
+                    modified = 0.0
+                if modified > last_modified:
+                    last_modified = modified
+                    last_frame_at = time.monotonic()
+                    with self._lock:
+                        if revision == self._revision:
+                            self._status = '采集中'
+                elif time.monotonic() - last_frame_at > FRAME_TIMEOUT:
+                    failure = '无画面：等待新帧超时'
+                    break
+                self._wait(POLL_INTERVAL)
+        finally:
+            self._set_status(failure, revision)
+            _stop_process(process)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.warning('Unable to remove old frame %s', path, exc_info=True)
 
 
-def _nonempty(path: Path) -> bool:
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
     try:
-        return path.stat().st_size > 0
-    except OSError:
-        return False
+        process.terminate()
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            log.error('ffmpeg did not exit after SIGKILL')
+    except ProcessLookupError:
+        pass
