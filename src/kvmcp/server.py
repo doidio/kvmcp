@@ -8,7 +8,7 @@ from typing import Literal
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from kvmcp.capture import VIDEO_SIZES, Capturer
+from kvmcp.capture import INPUT_FORMATS, VIDEO_SIZES, Capturer
 
 capturer: Capturer | None = None
 
@@ -32,7 +32,7 @@ def latest_frame() -> tuple[str, Image]:
     frame = capturer.latest()
     if isinstance(frame, str):
         raise ToolError(frame)
-    return (f'`画面延迟 {frame.age:.3f} 秒` `{frame.video_size}` `{frame.input_format}`', Image(data=frame.data, format='png'))
+    return (f'`{round(1000 * frame.age)} ms` `{frame.video_size}` `{frame.input_format}`', Image(data=frame.data, format='png'))
 
 
 @mcp.tool(structured_output=False, description='切换采集分辨率，可选 1920x1080 或 2560x1440')
@@ -45,6 +45,18 @@ def set_video_size(video_size: Literal[*VIDEO_SIZES]) -> None:
         capturer.set_video_size(video_size)
     except (OSError, ValueError, KeyError) as exc:
         raise ToolError(f'切换采集分辨率失败: {exc}') from exc
+
+
+@mcp.tool(structured_output=False, description='切换采集视频格式，可选 yuyv422 或 mjpeg')
+def set_input_format(input_format: Literal[*INPUT_FORMATS]) -> None:
+    if input_format not in INPUT_FORMATS:
+        raise ToolError(f'不支持的视频格式: {input_format}, 支持: {", ".join(INPUT_FORMATS)}')
+
+    assert capturer is not None
+    try:
+        capturer.set_input_format(input_format)
+    except (OSError, ValueError, KeyError) as exc:
+        raise ToolError(f'切换采集视频格式失败: {exc}') from exc
 
 
 def serve(cfg: dict, config_path: Path) -> None:

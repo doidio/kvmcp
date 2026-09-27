@@ -23,6 +23,7 @@ VIDEO_SIZES = ('1920x1080', '2560x1440')
 FRAME_TIMEOUT = 8.0
 POLL_INTERVAL = 0.25
 PIXEL_FORMATS = {'yuyv422': 'YUYV', 'mjpeg': 'MJPG'}
+INPUT_FORMATS = tuple(PIXEL_FORMATS)
 FORMAT_RE = re.compile(r"\[\d+\]:\s*'([^']+)'")
 SIZE_RE = re.compile(r'Size:\s*Discrete\s+(\d+x\d+)')
 FPS_RE = re.compile(r'\((\d+(?:\.\d+)?) fps\)')
@@ -101,10 +102,10 @@ def find_capture_devices(input_format: str, video_size: str, framerate: float) -
     return candidates
 
 
-def _save_video_size(config_path: Path, video_size: str) -> None:
+def _save_capture_setting(config_path: Path, key: str, value: str) -> None:
     """Preserve TOML comments and replace the configuration atomically."""
     document = tomlkit.parse(config_path.read_text(encoding='utf-8'))
-    document['capture']['video_size'] = video_size
+    document['capture'][key] = value
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=config_path.parent, prefix=f'.{config_path.name}.', delete=False) as file:
@@ -126,9 +127,9 @@ class Capturer:
         video_size = capture['video_size']
         if video_size not in VIDEO_SIZES:
             raise ValueError(f'不支持的分辨率: {video_size}')
-        self.input_format = str(capture['input_format'])
-        if not self.input_format:
-            raise ValueError('input_format 不能为空')
+        input_format = str(capture['input_format'])
+        if input_format not in INPUT_FORMATS:
+            raise ValueError(f'不支持的视频格式: {input_format}')
         self.framerate = float(capture['framerate'])
         if not 0 < self.framerate < 1000:
             raise ValueError('framerate 必须大于 0 且小于 1000')
@@ -136,9 +137,11 @@ class Capturer:
         self.config_path = config_path.resolve()
         self.capture_dir = Path(cfg['cache_dir']) / 'capture'
         self._desired_size = video_size
+        self._desired_format = input_format
         self._revision = 0
         self._active_file: Path | None = None
         self._active_size: str | None = None
+        self._active_format: str | None = None
         self._status = '采集未启动'
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -164,29 +167,44 @@ class Capturer:
         with self._lock:
             self._active_file = None
             self._active_size = None
+            self._active_format = None
             self._status = '采集已停止'
 
     def set_video_size(self, video_size: str) -> None:
         if video_size not in VIDEO_SIZES:
             raise ValueError(f'不支持的分辨率: {video_size}')
+        self._set_capture_setting('video_size', video_size)
+
+    def set_input_format(self, input_format: str) -> None:
+        if input_format not in INPUT_FORMATS:
+            raise ValueError(f'不支持的视频格式: {input_format}')
+        self._set_capture_setting('input_format', input_format)
+
+    def _set_capture_setting(self, key: str, value: str) -> None:
         with self._lock:
-            if video_size == self._desired_size:
+            current = self._desired_size if key == 'video_size' else self._desired_format
+            if value == current:
                 return
-            _save_video_size(self.config_path, video_size)
-            self._desired_size = video_size
+            _save_capture_setting(self.config_path, key, value)
+            if key == 'video_size':
+                self._desired_size = value
+            else:
+                self._desired_format = value
             self._revision += 1
             self._active_file = None
             self._active_size = None
-            self._status = '正在切换采集分辨率'
+            self._active_format = None
+            self._status = '正在切换采集分辨率' if key == 'video_size' else '正在切换采集格式'
             self._wake.set()
 
     def latest(self) -> Frame | str:
         with self._lock:
             path = self._active_file
             video_size = self._active_size
+            input_format = self._active_format
             revision = self._revision
             status = self._status
-        if path is None or video_size is None:
+        if path is None or video_size is None or input_format is None:
             return status
         try:
             with path.open('rb') as file:
@@ -202,11 +220,11 @@ class Capturer:
         age = max(0.0, time.time() - modified)
         if age > FRAME_TIMEOUT:
             return '无画面：画面未更新'
-        return Frame(data, age, video_size, self.input_format)
+        return Frame(data, age, video_size, input_format)
 
-    def _snapshot(self) -> tuple[str, int]:
+    def _snapshot(self) -> tuple[str, str, int]:
         with self._lock:
-            return self._desired_size, self._revision
+            return self._desired_format, self._desired_size, self._revision
 
     def _set_status(self, status: str, revision: int) -> None:
         with self._lock:
@@ -214,6 +232,7 @@ class Capturer:
                 self._status = status
                 self._active_file = None
                 self._active_size = None
+                self._active_format = None
 
     def _wait(self, seconds: float) -> None:
         self._wake.wait(seconds)
@@ -228,9 +247,9 @@ class Capturer:
                     log.warning('Unable to open ffmpeg.log; continuing without a capture log', exc_info=True)
                     log_file = files.enter_context(Path(os.devnull).open('ab'))
                 while not self._stop.is_set():
-                    video_size, revision = self._snapshot()
+                    input_format, video_size, revision = self._snapshot()
                     try:
-                        candidates = find_capture_devices(self.input_format, video_size, self.framerate)
+                        candidates = find_capture_devices(input_format, video_size, self.framerate)
                     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                         self._set_status(f'采集异常：设备扫描失败：{exc}', revision)
                         log.exception('Capture device scan failed')
@@ -241,22 +260,24 @@ class Capturer:
                         self._wait(1)
                         continue
                     for device in candidates:
-                        if self._stop.is_set() or revision != self._snapshot()[1]:
+                        if self._stop.is_set() or revision != self._snapshot()[2]:
                             break
-                        self._run_device(device, video_size, revision, log_file)
+                        self._run_device(device, input_format, video_size, revision, log_file)
                     self._wait(1)
         except OSError as exc:
             log.exception('Capture supervisor failed')
             with self._lock:
                 self._active_file = None
                 self._active_size = None
+                self._active_format = None
                 self._status = f'采集异常：后台任务已停止：{exc}'
 
-    def _run_device(self, device: str, video_size: str, revision: int, log_file: BinaryIO) -> None:
+    def _run_device(self, device: str, input_format: str, video_size: str, revision: int, log_file: BinaryIO) -> None:
         path = self.capture_dir / f'frame-{uuid.uuid4().hex}.png'
         with self._lock:
             self._active_file = path
             self._active_size = video_size
+            self._active_format = input_format
             self._status = '等待新画面'
         try:
             process = subprocess.Popen(
@@ -269,7 +290,7 @@ class Capturer:
                     '-f',
                     'v4l2',
                     '-input_format',
-                    self.input_format,
+                    input_format,
                     '-video_size',
                     video_size,
                     '-framerate',
@@ -300,7 +321,7 @@ class Capturer:
         last_frame_at = time.monotonic()
         failure = '无画面'
         try:
-            while not self._stop.is_set() and revision == self._snapshot()[1]:
+            while not self._stop.is_set() and revision == self._snapshot()[2]:
                 if (code := process.poll()) is not None:
                     failure = f'采集异常：ffmpeg 退出 {code}'
                     break

@@ -59,7 +59,7 @@ class CapturerTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.config = self.root / 'config.toml'
-        self.config.write_text('[capture]\n# keep me\nvideo_size = "1920x1080"\n', encoding='utf-8')
+        self.config.write_text('[capture]\n# keep me\nvideo_size = "1920x1080"\ninput_format = "yuyv422"\n', encoding='utf-8')
         self.cfg = {
             'cache_dir': str(self.root),
             'capture': {'video_size': '1920x1080', 'input_format': 'yuyv422', 'framerate': '5'},
@@ -77,6 +77,7 @@ class CapturerTests(unittest.TestCase):
         with self.capturer._lock:
             self.capturer._active_file = frame_path
             self.capturer._active_size = '1920x1080'
+            self.capturer._active_format = 'yuyv422'
         frame = self.capturer.latest()
         self.assertIsInstance(frame, Frame)
         self.assertEqual(frame.data, b'png bytes')
@@ -89,15 +90,39 @@ class CapturerTests(unittest.TestCase):
         with self.capturer._lock:
             self.capturer._active_file = frame_path
             self.capturer._active_size = '1920x1080'
+            self.capturer._active_format = 'yuyv422'
         self.capturer.set_video_size('2560x1440')
         self.assertIn('# keep me', self.config.read_text(encoding='utf-8'))
         self.assertIn('video_size = "2560x1440"', self.config.read_text(encoding='utf-8'))
         self.assertEqual(self.capturer.latest(), '正在切换采集分辨率')
 
+    def test_switch_input_format_persists_and_invalidates_old_frame(self):
+        frame_path = self.capturer.capture_dir / 'frame.png'
+        frame_path.write_bytes(b'old frame')
+        with self.capturer._lock:
+            self.capturer._active_file = frame_path
+            self.capturer._active_size = '1920x1080'
+            self.capturer._active_format = 'yuyv422'
+        self.capturer.set_input_format('mjpeg')
+        self.assertIn('# keep me', self.config.read_text(encoding='utf-8'))
+        self.assertIn('input_format = "mjpeg"', self.config.read_text(encoding='utf-8'))
+        self.assertEqual(self.capturer._snapshot(), ('mjpeg', '1920x1080', 1))
+        self.assertEqual(self.capturer.latest(), '正在切换采集格式')
+
+    def test_invalid_input_format_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.capturer.set_input_format('YUYV')
+        self.assertEqual(self.capturer._snapshot(), ('yuyv422', '1920x1080', 0))
+
     def test_failed_save_does_not_change_runtime_mode(self):
-        with patch('kvmcp.capture._save_video_size', side_effect=OSError('disk full')), self.assertRaises(OSError):
+        with patch('kvmcp.capture._save_capture_setting', side_effect=OSError('disk full')), self.assertRaises(OSError):
             self.capturer.set_video_size('2560x1440')
-        self.assertEqual(self.capturer._snapshot(), ('1920x1080', 0))
+        self.assertEqual(self.capturer._snapshot(), ('yuyv422', '1920x1080', 0))
+
+    def test_failed_format_save_does_not_change_runtime_mode(self):
+        with patch('kvmcp.capture._save_capture_setting', side_effect=OSError('disk full')), self.assertRaises(OSError):
+            self.capturer.set_input_format('mjpeg')
+        self.assertEqual(self.capturer._snapshot(), ('yuyv422', '1920x1080', 0))
 
     def test_stale_frame_is_not_returned(self):
         frame_path = self.capturer.capture_dir / 'frame.png'
@@ -107,6 +132,7 @@ class CapturerTests(unittest.TestCase):
         with self.capturer._lock:
             self.capturer._active_file = frame_path
             self.capturer._active_size = '1920x1080'
+            self.capturer._active_format = 'yuyv422'
         self.assertEqual(self.capturer.latest(), '无画面：画面未更新')
 
     def test_switch_stops_process_owned_by_supervisor(self):
@@ -131,7 +157,7 @@ class CapturerTests(unittest.TestCase):
             return process
 
         with patch('kvmcp.capture.subprocess.Popen', side_effect=spawn):
-            worker = threading.Thread(target=self.capturer._run_device, args=('/dev/video2', '1920x1080', 0, None))
+            worker = threading.Thread(target=self.capturer._run_device, args=('/dev/video2', 'yuyv422', '1920x1080', 0, None))
             worker.start()
             self.assertTrue(launched.wait(2))
             self.capturer.set_video_size('2560x1440')
@@ -171,6 +197,31 @@ class CapturerTests(unittest.TestCase):
         ):
             self.capturer._supervise()
         self.assertEqual(attempted, ['/dev/video2'])
+
+    def test_supervisor_uses_updated_input_format(self):
+        self.capturer.set_input_format('mjpeg')
+        modes = []
+
+        def scan(input_format, video_size, framerate):
+            modes.append((input_format, video_size, framerate))
+            self.capturer._stop.set()
+            return []
+
+        with patch('kvmcp.capture.find_capture_devices', side_effect=scan), patch.object(self.capturer, '_wait'):
+            self.capturer._supervise()
+        self.assertEqual(modes, [('mjpeg', '1920x1080', 5.0)])
+
+    def test_ffmpeg_receives_selected_input_format(self):
+        self.capturer.set_input_format('mjpeg')
+
+        class ExitedProcess:
+            def poll(self):
+                return 1
+
+        with patch('kvmcp.capture.subprocess.Popen', return_value=ExitedProcess()) as popen:
+            self.capturer._run_device('/dev/video2', 'mjpeg', '1920x1080', 1, None)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index('-input_format') + 1], 'mjpeg')
 
 
 if __name__ == '__main__':
